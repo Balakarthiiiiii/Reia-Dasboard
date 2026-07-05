@@ -8,6 +8,7 @@ import {
   Store, Receipt, LayoutDashboard, Sparkles, Loader2,
 } from "lucide-react";
 import { useSupaTable } from "./useSupaTable";
+import { supabase } from "./supabaseClient";
 
 /* ---------------------------------------------------------------
    RÉIA — Store Profitability Ledger
@@ -46,6 +47,7 @@ const CATEGORY_OPTS = ["Ring", "Necklace", "Bangle", "Earring", "Bracelet", "Pen
 const PURITY_OPTS = ["9K", "14K", "18K", "22K"];
 const GOLD_COLOR_OPTS = ["Yellow Gold", "White Gold", "Rose Gold"];
 const EXPENSE_CATS = ["Petrol / Transport", "Refreshments", "External Repairs", "Parcel / Courier", "Packaging", "Miscellaneous"];
+const ORDER_TYPE_OPTS = ["Custom Order", "In-Stock"];
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
 const MC_COST = 1000;
@@ -80,10 +82,12 @@ const salesToDb = (f) => ({
   dia_wt: parseFloat(f.diaWt) || 0,
   mc_rate: parseFloat(f.mcRate) || 0,
   sale_price: parseFloat(f.salePrice) || 0,
+  order_type: f.orderType || "In-Stock",
 });
 const salesFromDb = (r) => ({
   id: r.id, date: r.date, store: r.store, category: r.category, purity: r.purity,
   goldColor: r.gold_color, goldWt: r.gold_wt, diaWt: r.dia_wt, mcRate: r.mc_rate, salePrice: r.sale_price,
+  orderType: r.order_type || "In-Stock",
 });
 
 const overheadsToDb = (f) => ({
@@ -107,9 +111,11 @@ const expensesToDb = (f) => ({
   category: f.category,
   amount: parseFloat(f.amount) || 0,
   note: f.note || "",
+  receipt_url: f.receiptUrl || null,
 });
 const expensesFromDb = (r) => ({
   id: r.id, date: r.date, store: r.store, category: r.category, amount: r.amount, note: r.note,
+  receiptUrl: r.receipt_url,
 });
 
 const Diamond = ({ size = 6, color = COLORS.burgundy }) => (
@@ -190,6 +196,7 @@ export default function App() {
 
   const [tab, setTab] = useState("overview");
   const [storeFilter, setStoreFilter] = useState("all");
+  const [periodFilter, setPeriodFilter] = useState("all");
 
   useEffect(() => {
     const el = document.createElement("style");
@@ -261,6 +268,13 @@ export default function App() {
 
   const allMonths = useMemo(() => Object.keys(monthlyData).sort(), [monthlyData]);
 
+  /* Months actually used for KPI/report aggregation — "All Time" uses every
+     month; picking a specific month/year narrows every report below to it. */
+  const viewMonths = useMemo(
+    () => (periodFilter === "all" ? allMonths : allMonths.filter(m => m === periodFilter)),
+    [allMonths, periodFilter]
+  );
+
   const chartData = useMemo(() => allMonths.map(m => {
     const storesInMonth = monthlyData[m];
     let row = { month: monthLabel(m), key: m };
@@ -283,7 +297,7 @@ export default function App() {
     let revenue = 0, gross = 0, overhead = 0, net = 0, makingM = 0, diaM = 0, gst = 0;
     const perStoreTotals = {};
     STORES.forEach(st => perStoreTotals[st.id] = { revenue: 0, gross: 0, overhead: 0, net: 0, months: 0 });
-    allMonths.forEach(m => {
+    viewMonths.forEach(m => {
       STORES.forEach(st => {
         if (storeFilter !== "all" && storeFilter !== st.id) return;
         const b = monthlyData[m][st.id];
@@ -299,7 +313,7 @@ export default function App() {
       });
     });
     return { revenue, gross, overhead, net, makingM, diaM, gst, perStoreTotals };
-  }, [allMonths, monthlyData, storeFilter]);
+  }, [viewMonths, monthlyData, storeFilter]);
 
   const lastTwo = allMonths.slice(-2);
   const momDelta = useMemo(() => {
@@ -328,7 +342,7 @@ export default function App() {
   const expenseBreakdown = useMemo(() => {
     let rent = 0, elec = 0, maint = 0, sal = 0;
     const cats = {};
-    allMonths.forEach(m => STORES.forEach(st => {
+    viewMonths.forEach(m => STORES.forEach(st => {
       if (storeFilter !== "all" && storeFilter !== st.id) return;
       const b = monthlyData[m][st.id]; if (!b) return;
       rent += b.rent; elec += b.electricity; maint += b.maintenance; sal += b.salaries;
@@ -343,7 +357,7 @@ export default function App() {
     ].filter(x => x.value > 0).sort((a, b) => b.value - a.value);
     const total = arr.reduce((a, x) => a + x.value, 0);
     return { items: arr, total };
-  }, [allMonths, monthlyData, storeFilter]);
+  }, [viewMonths, monthlyData, storeFilter]);
 
   const flags = useMemo(() => {
     const out = [];
@@ -431,17 +445,33 @@ export default function App() {
               RÉIA <span style={{ fontWeight: 400, fontStyle: "italic", color: COLORS.beigeMuted, fontSize: 22 }}>Profitability Ledger</span>
             </h1>
           </div>
-          <div style={{ display: "flex", gap: 8 }}>
-            {["all", ...STORES.map(s => s.id)].map(f => (
-              <button key={f} onClick={() => setStoreFilter(f)} style={{
-                fontFamily: "'Jost',sans-serif", fontSize: 12.5, padding: "8px 16px", borderRadius: 3,
-                border: `1px solid ${storeFilter === f ? COLORS.white : "#4A3F35"}`,
-                background: storeFilter === f ? COLORS.burgundy : "transparent",
-                color: storeFilter === f ? COLORS.white : COLORS.beigeMuted, cursor: "pointer", fontWeight: 500,
-              }}>
-                {f === "all" ? "Both Stores" : STORES.find(s => s.id === f).short}
-              </button>
-            ))}
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <select
+              value={periodFilter}
+              onChange={e => setPeriodFilter(e.target.value)}
+              style={{
+                fontFamily: "'Jost',sans-serif", fontSize: 12.5, padding: "8px 12px", borderRadius: 3,
+                border: `1px solid #4A3F35`, background: periodFilter !== "all" ? COLORS.burgundy : "transparent",
+                color: periodFilter !== "all" ? COLORS.white : COLORS.beigeMuted, cursor: "pointer", fontWeight: 500,
+              }}
+            >
+              <option value="all">All Time</option>
+              {allMonths.slice().reverse().map(m => (
+                <option key={m} value={m}>{monthLabel(m)}</option>
+              ))}
+            </select>
+            <div style={{ display: "flex", gap: 8 }}>
+              {["all", ...STORES.map(s => s.id)].map(f => (
+                <button key={f} onClick={() => setStoreFilter(f)} style={{
+                  fontFamily: "'Jost',sans-serif", fontSize: 12.5, padding: "8px 16px", borderRadius: 3,
+                  border: `1px solid ${storeFilter === f ? COLORS.white : "#4A3F35"}`,
+                  background: storeFilter === f ? COLORS.burgundy : "transparent",
+                  color: storeFilter === f ? COLORS.white : COLORS.beigeMuted, cursor: "pointer", fontWeight: 500,
+                }}>
+                  {f === "all" ? "Both Stores" : STORES.find(s => s.id === f).short}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
         <div style={{ display: "flex", gap: 4, marginTop: 22, flexWrap: "wrap" }}>
@@ -470,10 +500,10 @@ export default function App() {
         {tab === "overview" && (
           <Overview totals={totals} chartData={chartData} momDelta={momDelta} allMonths={allMonths}
             expenseBreakdown={expenseBreakdown} flags={flags.slice(0, 4)}
-            storeFilter={storeFilter} monthlyData={monthlyData} />
+            storeFilter={storeFilter} monthlyData={monthlyData} periodFilter={periodFilter} />
         )}
         {tab === "sales" && <SalesTab enriched={salesEnriched} onAdd={salesTable.add} onRemove={salesTable.remove} />}
-        {tab === "merchandise" && <MerchandiseTab enriched={salesEnriched} storeFilter={storeFilter} />}
+        {tab === "merchandise" && <MerchandiseTab enriched={salesEnriched} storeFilter={storeFilter} periodFilter={periodFilter} />}
         {tab === "overhead" && <OverheadTab overheads={overheads} onAdd={overheadsTable.add} onRemove={overheadsTable.remove} />}
         {tab === "expenses" && <ExpensesTab expenses={expenses} onAdd={expensesTable.add} onRemove={expensesTable.remove} />}
         {tab === "insights" && <InsightsTab flags={flags} totals={totals} allMonths={allMonths} />}
@@ -483,8 +513,9 @@ export default function App() {
 }
 
 /* ================= OVERVIEW ================= */
-function Overview({ totals, chartData, momDelta, allMonths, expenseBreakdown, flags, storeFilter, monthlyData }) {
+function Overview({ totals, chartData, momDelta, allMonths, expenseBreakdown, flags, storeFilter, monthlyData, periodFilter }) {
   const marginPct = totals.revenue ? (totals.net / totals.revenue) * 100 : 0;
+  const periodLabel = periodFilter === "all" ? "All Time" : monthLabel(periodFilter);
 
   if (allMonths.length === 0) {
     return <EmptyState title="No data yet" desc="Add sales, store overheads, and daily expenses from the tabs above. Once entries exist for a month, your gross and net profit will appear here automatically." />;
@@ -492,7 +523,7 @@ function Overview({ totals, chartData, momDelta, allMonths, expenseBreakdown, fl
 
   return (
     <div>
-      <SectionTitle sub="Diamond weight and making charges drive your margin — gold is pass-through at cost, GST is tracked separately as tax, not revenue.">Business Overview</SectionTitle>
+      <SectionTitle sub={`Diamond weight and making charges drive your margin — gold is pass-through at cost, GST is tracked separately as tax, not revenue. Showing: ${periodLabel}.`}>Business Overview</SectionTitle>
 
       <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 26 }}>
         <KPI label="Total Revenue" value={inrK(totals.revenue)} delta={momDelta.revenue} accent />
@@ -637,7 +668,7 @@ function EmptyState({ title, desc }) {
 
 /* ================= SALES TAB ================= */
 function SalesTab({ enriched, onAdd, onRemove }) {
-  const blank = { date: "", store: "s1", category: "Ring", purity: "18K", goldColor: "Yellow Gold", goldWt: "", diaWt: "", mcRate: MC_SALE_DEFAULT, salePrice: "" };
+  const blank = { date: "", store: "s1", category: "Ring", purity: "18K", goldColor: "Yellow Gold", goldWt: "", diaWt: "", mcRate: MC_SALE_DEFAULT, salePrice: "", orderType: "In-Stock" };
   const [form, setForm] = useState(blank);
   const [saving, setSaving] = useState(false);
 
@@ -680,6 +711,11 @@ function SalesTab({ enriched, onAdd, onRemove }) {
               {GOLD_COLOR_OPTS.map(c => <option key={c}>{c}</option>)}
             </Select>
           </div>
+          <div><Label>Order Type</Label>
+            <Select value={form.orderType} onChange={e => setForm({ ...form, orderType: e.target.value })}>
+              {ORDER_TYPE_OPTS.map(o => <option key={o}>{o}</option>)}
+            </Select>
+          </div>
           <div><Label>Gold Weight (g)</Label><Input type="number" step="0.01" placeholder="4.20" value={form.goldWt} onChange={e => setForm({ ...form, goldWt: e.target.value })} /></div>
           <div><Label>Diamond Weight (ct)</Label><Input type="number" step="0.01" placeholder="0.85" value={form.diaWt} onChange={e => setForm({ ...form, diaWt: e.target.value })} /></div>
           <div><Label>Making Rate Charged (₹/g)</Label><Input type="number" placeholder="1650–2000" value={form.mcRate} onChange={e => setForm({ ...form, mcRate: e.target.value })} /></div>
@@ -700,7 +736,7 @@ function SalesTab({ enriched, onAdd, onRemove }) {
           <div style={{ overflowX: "auto" }}>
             <table>
               <thead><tr>
-                <th>Date</th><th>Store</th><th>Item</th><th>Purity</th><th>Gold Color</th><th>Gold (g)</th><th>Diamond (ct)</th><th>MC ₹/g</th><th>Sale Price</th><th>GST (3%)</th><th>Invoice Total</th><th>Gross Profit</th><th></th>
+                <th>Date</th><th>Store</th><th>Item</th><th>Order Type</th><th>Purity</th><th>Gold Color</th><th>Gold (g)</th><th>Diamond (ct)</th><th>MC ₹/g</th><th>Sale Price</th><th>GST (3%)</th><th>Invoice Total</th><th>Gross Profit</th><th></th>
               </tr></thead>
               <tbody>
                 {enriched.map(s => (
@@ -708,6 +744,7 @@ function SalesTab({ enriched, onAdd, onRemove }) {
                     <td>{s.date}</td>
                     <td>{STORES.find(st => st.id === s.store)?.short}</td>
                     <td>{s.category}</td>
+                    <td>{s.orderType || "In-Stock"}</td>
                     <td>{s.purity}</td>
                     <td>{s.goldColor}</td>
                     <td>{s.goldWt}</td>
@@ -730,8 +767,14 @@ function SalesTab({ enriched, onAdd, onRemove }) {
 }
 
 /* ================= MERCHANDISE REPORT TAB ================= */
-function MerchandiseTab({ enriched, storeFilter }) {
-  const filtered = useMemo(() => enriched.filter(s => storeFilter === "all" || s.store === storeFilter), [enriched, storeFilter]);
+function MerchandiseTab({ enriched, storeFilter, periodFilter }) {
+  const filtered = useMemo(
+    () => enriched.filter(s =>
+      (storeFilter === "all" || s.store === storeFilter) &&
+      (periodFilter === "all" || monthKey(s.date) === periodFilter)
+    ),
+    [enriched, storeFilter, periodFilter]
+  );
 
   const byCategory = useMemo(() => {
     const map = {};
@@ -772,8 +815,48 @@ function MerchandiseTab({ enriched, storeFilter }) {
     return top;
   }, [filtered]);
 
+  /* ---------- Order type: Custom Order vs In-Stock ---------- */
+  const orderTypeStats = useMemo(() => {
+    const monthsSeen = new Set();
+    let custom = 0, instock = 0;
+    filtered.forEach(s => {
+      const m = monthKey(s.date);
+      if (m) monthsSeen.add(m);
+      if (s.orderType === "Custom Order") custom += 1; else instock += 1;
+    });
+    const monthCount = monthsSeen.size || 1;
+    return {
+      custom, instock, monthCount,
+      avgCustomPerMonth: custom / monthCount,
+      avgInStockPerMonth: instock / monthCount,
+    };
+  }, [filtered]);
+
+  const orderTypeSplit = useMemo(() => ([
+    { name: "Custom Order", units: orderTypeStats.custom },
+    { name: "In-Stock", units: orderTypeStats.instock },
+  ]), [orderTypeStats]);
+
+  const byCategoryOrderType = useMemo(() => {
+    const map = {};
+    filtered.forEach(s => {
+      const k = s.category || "Other";
+      if (!map[k]) map[k] = { name: k, custom: 0, instock: 0, total: 0 };
+      map[k].total += 1;
+      if (s.orderType === "Custom Order") map[k].custom += 1; else map[k].instock += 1;
+    });
+    return Object.values(map)
+      .map(c => ({
+        ...c,
+        customPct: c.total ? (c.custom / c.total) * 100 : 0,
+        instockPct: c.total ? (c.instock / c.total) * 100 : 0,
+      }))
+      .sort((a, b) => b.total - a.total);
+  }, [filtered]);
+
   const topCategory = byCategory[0];
   const topGoldColor = byGoldColor[0];
+  const periodLabel = periodFilter === "all" ? "All Time" : monthLabel(periodFilter);
 
   if (filtered.length === 0) {
     return <EmptyState title="No sales to report on yet" desc="Once you log sales in the Sales Entry tab — including gold color — this report will show your best-selling categories, colors, and store performance." />;
@@ -781,7 +864,7 @@ function MerchandiseTab({ enriched, storeFilter }) {
 
   return (
     <div>
-      <SectionTitle sub="Which products, gold colors and categories are moving at each store.">Merchandise Report</SectionTitle>
+      <SectionTitle sub={`Which products, gold colors and categories are moving at each store. Showing: ${periodLabel}.`}>Merchandise Report</SectionTitle>
 
       <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 22 }}>
         <KPI label="Best-Selling Category" value={topCategory ? topCategory.name : "—"} sub={topCategory ? `${topCategory.units} unit${topCategory.units !== 1 ? "s" : ""} sold` : ""} accent />
@@ -851,7 +934,7 @@ function MerchandiseTab({ enriched, storeFilter }) {
         </table>
       </Card>
 
-      <Card>
+      <Card style={{ marginBottom: 18 }}>
         <Eyebrow>Gold Color Breakdown</Eyebrow>
         <table>
           <thead><tr><th>Gold Color</th><th>Units</th><th>Share</th><th>Revenue</th></tr></thead>
@@ -862,6 +945,71 @@ function MerchandiseTab({ enriched, storeFilter }) {
                 <td>{c.units}</td>
                 <td>{((c.units / filtered.length) * 100).toFixed(0)}%</td>
                 <td>{inr(c.revenue)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </Card>
+
+      <SectionTitle sub="Custom orders are made to a customer's specification; In-Stock pieces are sold straight off the display. Averages are per calendar month across the sales currently shown above.">Custom Order vs In-Stock</SectionTitle>
+
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 22 }}>
+        <KPI label="Avg Custom Orders / Month" value={orderTypeStats.avgCustomPerMonth.toFixed(1)} sub={`${orderTypeStats.custom} total custom order${orderTypeStats.custom !== 1 ? "s" : ""}`} accent />
+        <KPI label="Avg In-Stock Sales / Month" value={orderTypeStats.avgInStockPerMonth.toFixed(1)} sub={`${orderTypeStats.instock} total in-stock sale${orderTypeStats.instock !== 1 ? "s" : ""}`} />
+        <KPI label="Custom Order Share" value={`${((orderTypeStats.custom / filtered.length) * 100).toFixed(0)}%`} sub={`of ${filtered.length} sale${filtered.length !== 1 ? "s" : ""} shown`} />
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18, marginBottom: 18 }}>
+        <Card>
+          <Eyebrow>Custom vs In-Stock Split</Eyebrow>
+          <ResponsiveContainer width="100%" height={210}>
+            <PieChart>
+              <Pie data={orderTypeSplit} dataKey="units" nameKey="name" cx="50%" cy="50%" innerRadius={48} outerRadius={85} paddingAngle={2}>
+                {orderTypeSplit.map((e, i) => <Cell key={i} fill={TONES[i % TONES.length]} stroke={COLORS.black} strokeWidth={0.75} />)}
+              </Pie>
+              <Tooltip contentStyle={{ fontFamily: "'Jost',sans-serif", fontSize: 12, border: `1px solid ${COLORS.beigeDeep}`, borderRadius: 4 }} />
+            </PieChart>
+          </ResponsiveContainer>
+          <div style={{ marginTop: 8 }}>
+            {orderTypeSplit.map((e, i) => (
+              <div key={e.name} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "5px 2px", borderBottom: i < orderTypeSplit.length - 1 ? "1px solid #EDE3D0" : "none" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, fontFamily: "'Jost',sans-serif" }}>
+                  <span style={{ width: 9, height: 9, borderRadius: 2, background: TONES[i % TONES.length], border: `1px solid ${COLORS.black}`, display: "inline-block" }} />
+                  {e.name}
+                </div>
+                <span style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 12 }}>{e.units} ({filtered.length ? ((e.units / filtered.length) * 100).toFixed(0) : 0}%)</span>
+              </div>
+            ))}
+          </div>
+        </Card>
+
+        <Card>
+          <Eyebrow>Custom Order % by Category</Eyebrow>
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={byCategoryOrderType} layout="vertical" margin={{ left: 10 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={COLORS.beigeDeep} />
+              <XAxis type="number" domain={[0, 100]} tickFormatter={v => `${v}%`} tick={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 10, fill: "#8A7C6B" }} />
+              <YAxis type="category" dataKey="name" width={80} tick={{ fontFamily: "'Jost',sans-serif", fontSize: 12, fill: "#8A7C6B" }} />
+              <Tooltip formatter={v => `${v.toFixed(0)}%`} contentStyle={{ fontFamily: "'Jost',sans-serif", fontSize: 12, border: `1px solid ${COLORS.beigeDeep}`, borderRadius: 4 }} />
+              <Bar dataKey="customPct" name="Custom Order %" fill={COLORS.burgundy} radius={[0, 3, 3, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </Card>
+      </div>
+
+      <Card>
+        <Eyebrow>Custom vs In-Stock by Category</Eyebrow>
+        <table>
+          <thead><tr><th>Category</th><th>Total Units</th><th>Custom Orders</th><th>In-Stock</th><th>% Custom</th><th>% In-Stock</th></tr></thead>
+          <tbody>
+            {byCategoryOrderType.map(c => (
+              <tr key={c.name}>
+                <td style={{ fontFamily: "'Jost',sans-serif", fontWeight: 500 }}>{c.name}</td>
+                <td>{c.total}</td>
+                <td>{c.custom}</td>
+                <td>{c.instock}</td>
+                <td>{c.customPct.toFixed(0)}%</td>
+                <td>{c.instockPct.toFixed(0)}%</td>
               </tr>
             ))}
           </tbody>
@@ -937,17 +1085,47 @@ function OverheadTab({ overheads, onAdd, onRemove }) {
 }
 
 /* ================= EXPENSES TAB ================= */
+const RECEIPTS_BUCKET = "receipts";
+
 function ExpensesTab({ expenses, onAdd, onRemove }) {
   const blank = { date: "", store: "s1", category: EXPENSE_CATS[0], amount: "", note: "" };
   const [form, setForm] = useState(blank);
   const [saving, setSaving] = useState(false);
+  const [receiptFile, setReceiptFile] = useState(null);
+  const [uploadError, setUploadError] = useState(null);
+
+  const onPickFile = (e) => {
+    const file = e.target.files?.[0] || null;
+    setUploadError(null);
+    setReceiptFile(file);
+  };
 
   const add = async () => {
     if (!form.date || !form.amount) return;
     setSaving(true);
-    await onAdd(form);
+    setUploadError(null);
+
+    let receiptUrl = null;
+    if (receiptFile) {
+      const ext = receiptFile.name.split(".").pop();
+      const path = `${form.date || "undated"}/${uid()}.${ext}`;
+      const { error: upErr } = await supabase.storage
+        .from(RECEIPTS_BUCKET)
+        .upload(path, receiptFile, { cacheControl: "3600", upsert: false });
+      if (upErr) {
+        console.error("Receipt upload failed:", upErr.message);
+        setUploadError(upErr.message);
+        setSaving(false);
+        return;
+      }
+      const { data: pub } = supabase.storage.from(RECEIPTS_BUCKET).getPublicUrl(path);
+      receiptUrl = pub?.publicUrl || null;
+    }
+
+    await onAdd({ ...form, receiptUrl });
     setSaving(false);
     setForm(blank);
+    setReceiptFile(null);
   };
 
   return (
@@ -970,6 +1148,25 @@ function ExpensesTab({ expenses, onAdd, onRemove }) {
           </div>
           <div><Label>Amount (₹)</Label><Input type="number" value={form.amount} onChange={e => setForm({ ...form, amount: e.target.value })} /></div>
           <div style={{ gridColumn: "1 / -1" }}><Label>Note (optional)</Label><Input placeholder="e.g. bike service, courier to customer" value={form.note} onChange={e => setForm({ ...form, note: e.target.value })} /></div>
+          <div style={{ gridColumn: "1 / -1" }}>
+            <Label>Receipt Photo (optional)</Label>
+            <input
+              type="file"
+              accept="image/*"
+              onChange={onPickFile}
+              style={{ width: "100%", padding: "9px 0", fontFamily: "'Jost',sans-serif", fontSize: 13, color: COLORS.ink }}
+            />
+            {receiptFile && (
+              <div style={{ marginTop: 6, fontFamily: "'IBM Plex Mono',monospace", fontSize: 11.5, color: COLORS.burgundy }}>
+                Selected: {receiptFile.name}
+              </div>
+            )}
+            {uploadError && (
+              <div style={{ marginTop: 6, fontFamily: "'Jost',sans-serif", fontSize: 12, color: COLORS.burgundyBright }}>
+                Upload failed: {uploadError}
+              </div>
+            )}
+          </div>
         </div>
         <div style={{ marginTop: 16 }}><Btn onClick={add}>{saving ? <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} /> : <Plus size={14} />} Add Expense</Btn></div>
       </Card>
@@ -978,7 +1175,7 @@ function ExpensesTab({ expenses, onAdd, onRemove }) {
         <Eyebrow>{expenses.length} Expense{expenses.length !== 1 ? "s" : ""} Logged</Eyebrow>
         {expenses.length === 0 ? <EmptyState title="No daily expenses yet" desc="As you send spend photos, log the date, store, category and amount here — the dashboard will flag any category that spikes month over month." /> : (
           <table>
-            <thead><tr><th>Date</th><th>Store</th><th>Category</th><th>Amount</th><th>Note</th><th></th></tr></thead>
+            <thead><tr><th>Date</th><th>Store</th><th>Category</th><th>Amount</th><th>Note</th><th>Receipt</th><th></th></tr></thead>
             <tbody>
               {expenses.map(e => (
                 <tr key={e.id}>
@@ -987,6 +1184,15 @@ function ExpensesTab({ expenses, onAdd, onRemove }) {
                   <td>{e.category}</td>
                   <td>{inr(e.amount)}</td>
                   <td style={{ fontFamily: "'Jost',sans-serif" }}>{e.note}</td>
+                  <td>
+                    {e.receiptUrl ? (
+                      <a href={e.receiptUrl} target="_blank" rel="noopener noreferrer" style={{ color: COLORS.burgundy, fontFamily: "'Jost',sans-serif", fontWeight: 500 }}>
+                        View
+                      </a>
+                    ) : (
+                      <span style={{ color: "#B3A692" }}>—</span>
+                    )}
+                  </td>
                   <td><button onClick={() => onRemove(e.id)} style={{ background: "none", border: "none", cursor: "pointer", color: COLORS.burgundyBright }}><Trash2 size={13} /></button></td>
                 </tr>
               ))}
