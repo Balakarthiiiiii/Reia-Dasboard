@@ -455,9 +455,9 @@ export default function App() {
                 color: periodFilter !== "all" ? COLORS.white : COLORS.beigeMuted, cursor: "pointer", fontWeight: 500,
               }}
             >
-              <option value="all">All Time</option>
+              <option value="all" style={{ color: COLORS.ink, background: COLORS.white }}>All Time</option>
               {allMonths.slice().reverse().map(m => (
-                <option key={m} value={m}>{monthLabel(m)}</option>
+                <option key={m} value={m} style={{ color: COLORS.ink, background: COLORS.white }}>{monthLabel(m)}</option>
               ))}
             </select>
             <div style={{ display: "flex", gap: 8 }}>
