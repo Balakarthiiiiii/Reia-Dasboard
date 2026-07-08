@@ -105,3 +105,88 @@ export function useSupaTable(table, toDb, fromDb) {
 
   return { rows, add, remove, loading, error, refetch: fetchAll };
 }
+
+/**
+ * Dedicated hook for the daily 24K gold rate. Unlike sales/overheads/expenses,
+ * a rate is keyed by date (one rate per day) and re-entering the same date
+ * should UPDATE that day's rate rather than create a duplicate row — so this
+ * uses upsert (on the `date` column) instead of a plain insert.
+ */
+export function useGoldRates() {
+  const [rates, setRates] = useState([]); // [{ date: "2026-07-08", rate24k: 7250 }, ...]
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  const fetchAll = useCallback(async () => {
+    setLoading(true);
+    const { data, error } = await supabase
+      .from("gold_rates")
+      .select("*")
+      .order("date", { ascending: true });
+    if (error) {
+      console.error("Failed to load gold_rates:", error.message);
+      setError(error.message);
+      setLoading(false);
+      return;
+    }
+    setRates(data.map((r) => ({ date: r.date, rate24k: r.rate_24k })));
+    setError(null);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    fetchAll();
+  }, [fetchAll]);
+
+  useEffect(() => {
+    const channel = supabase
+      .channel("realtime:gold_rates")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "gold_rates" },
+        (payload) => {
+          if (payload.eventType === "DELETE") {
+            setRates((prev) => prev.filter((r) => r.date !== payload.old.date));
+            return;
+          }
+          const incoming = { date: payload.new.date, rate24k: payload.new.rate_24k };
+          setRates((prev) => {
+            const idx = prev.findIndex((r) => r.date === incoming.date);
+            if (idx === -1) return [...prev, incoming].sort((a, b) => a.date.localeCompare(b.date));
+            const next = [...prev];
+            next[idx] = incoming;
+            return next;
+          });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
+  const upsertRate = useCallback(async (date, rate24k) => {
+    const { data, error } = await supabase
+      .from("gold_rates")
+      .upsert([{ date, rate_24k: rate24k }], { onConflict: "date" })
+      .select();
+    if (error) {
+      console.error("Failed to save gold rate:", error.message);
+      setError(error.message);
+      return false;
+    }
+    const saved = { date: data[0].date, rate24k: data[0].rate_24k };
+    setRates((prev) => {
+      const idx = prev.findIndex((r) => r.date === saved.date);
+      if (idx === -1) return [...prev, saved].sort((a, b) => a.date.localeCompare(b.date));
+      const next = [...prev];
+      next[idx] = saved;
+      return next;
+    });
+    setError(null);
+    return true;
+  }, []);
+
+  return { rates, upsertRate, loading, error, refetch: fetchAll };
+}

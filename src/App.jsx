@@ -7,7 +7,7 @@ import {
   Plus, Trash2, Gem, TrendingUp, TrendingDown, AlertTriangle,
   Store, Receipt, LayoutDashboard, Sparkles, Loader2,
 } from "lucide-react";
-import { useSupaTable } from "./useSupaTable";
+import { useSupaTable, useGoldRates } from "./useSupaTable";
 import { supabase } from "./supabaseClient";
 
 /* ---------------------------------------------------------------
@@ -45,6 +45,7 @@ const STORES = [
 
 const CATEGORY_OPTS = ["Ring", "Necklace", "Bangle", "Earring", "Bracelet", "Pendant", "Chain", "Other"];
 const PURITY_OPTS = ["9K", "14K", "18K", "22K"];
+const PURITY_KARAT = { "24K": 24, "22K": 22, "18K": 18, "14K": 14, "9K": 9 };
 const GOLD_COLOR_OPTS = ["Yellow Gold", "White Gold", "Rose Gold"];
 const EXPENSE_CATS = ["Petrol / Transport", "Refreshments", "External Repairs", "Parcel / Courier", "Packaging", "Miscellaneous"];
 const ORDER_TYPE_OPTS = ["Custom Order", "In-Stock"];
@@ -68,6 +69,23 @@ const monthLabel = (key) => {
   if (!key) return "";
   const [y, m] = key.split("-");
   return MONTHS[parseInt(m, 10) - 1] + " " + y.slice(2);
+};
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
+/* Finds the 24K gold rate that applies to a given sale date — an exact match
+   if that day's rate was entered, otherwise the most recent rate entered on
+   or before that date (so a sale doesn't go un-costed just because today's
+   rate hasn't been typed in yet). Returns null if no rate exists yet at all. */
+const findApplicableRate = (rates, dateStr) => {
+  if (!dateStr || !rates || rates.length === 0) return null;
+  const onOrBefore = rates.filter(r => r.date <= dateStr).sort((a, b) => b.date.localeCompare(a.date));
+  if (onOrBefore.length > 0) return onOrBefore[0];
+  // No rate on/before this date — fall back to the earliest rate on record.
+  return rates.slice().sort((a, b) => a.date.localeCompare(b.date))[0];
+};
+const rateForPurity = (rate24k, purity) => {
+  const karat = PURITY_KARAT[purity] || 24;
+  return (parseFloat(rate24k) || 0) * (karat / 24);
 };
 
 /* ---------------- DB <-> app field mappers ---------------- */
@@ -187,12 +205,13 @@ export default function App() {
   const salesTable = useSupaTable("sales", salesToDb, salesFromDb);
   const overheadsTable = useSupaTable("overheads", overheadsToDb, overheadsFromDb);
   const expensesTable = useSupaTable("expenses", expensesToDb, expensesFromDb);
+  const goldRatesTable = useGoldRates();
 
   const sales = salesTable.rows;
   const overheads = overheadsTable.rows;
   const expenses = expensesTable.rows;
-  const ready = !salesTable.loading && !overheadsTable.loading && !expensesTable.loading;
-  const dbError = salesTable.error || overheadsTable.error || expensesTable.error;
+  const ready = !salesTable.loading && !overheadsTable.loading && !expensesTable.loading && !goldRatesTable.loading;
+  const dbError = salesTable.error || overheadsTable.error || expensesTable.error || goldRatesTable.error;
 
   const [tab, setTab] = useState("overview");
   const [storeFilter, setStoreFilter] = useState("all");
@@ -502,7 +521,15 @@ export default function App() {
             expenseBreakdown={expenseBreakdown} flags={flags.slice(0, 4)}
             storeFilter={storeFilter} monthlyData={monthlyData} periodFilter={periodFilter} />
         )}
-        {tab === "sales" && <SalesTab enriched={salesEnriched} onAdd={salesTable.add} onRemove={salesTable.remove} />}
+        {tab === "sales" && (
+          <SalesTab
+            enriched={salesEnriched}
+            onAdd={salesTable.add}
+            onRemove={salesTable.remove}
+            goldRates={goldRatesTable.rates}
+            onSaveRate={goldRatesTable.upsertRate}
+          />
+        )}
         {tab === "merchandise" && <MerchandiseTab enriched={salesEnriched} storeFilter={storeFilter} periodFilter={periodFilter} />}
         {tab === "overhead" && <OverheadTab overheads={overheads} onAdd={overheadsTable.add} onRemove={overheadsTable.remove} />}
         {tab === "expenses" && <ExpensesTab expenses={expenses} onAdd={expensesTable.add} onRemove={expensesTable.remove} />}
@@ -667,10 +694,57 @@ function EmptyState({ title, desc }) {
 }
 
 /* ================= SALES TAB ================= */
-function SalesTab({ enriched, onAdd, onRemove }) {
+function SalesTab({ enriched, onAdd, onRemove, goldRates, onSaveRate }) {
   const blank = { date: "", store: "s1", category: "Ring", purity: "18K", goldColor: "Yellow Gold", goldWt: "", diaWt: "", mcRate: MC_SALE_DEFAULT, salePrice: "", orderType: "In-Stock" };
   const [form, setForm] = useState(blank);
   const [saving, setSaving] = useState(false);
+  const [priceOverridden, setPriceOverridden] = useState(false);
+
+  /* ---------- Daily 24K gold rate panel ---------- */
+  const [rateDate, setRateDate] = useState(todayStr());
+  const [rateInput, setRateInput] = useState("");
+  const [savingRate, setSavingRate] = useState(false);
+  const existingRateForDate = goldRates.find(r => r.date === rateDate);
+  const rate24kPreview = rateInput !== "" ? (parseFloat(rateInput) || 0) : (existingRateForDate ? existingRateForDate.rate24k : 0);
+
+  const saveRate = async () => {
+    const val = parseFloat(rateInput);
+    if (!val) return;
+    setSavingRate(true);
+    await onSaveRate(rateDate, val);
+    setSavingRate(false);
+    setRateInput("");
+  };
+
+  const recentRates = useMemo(() => goldRates.slice().sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6), [goldRates]);
+
+  /* ---------- Auto-calculated (overridable) sale price ---------- */
+  const computeAutoPrice = (f) => {
+    const applicable = findApplicableRate(goldRates, f.date);
+    if (!applicable) return null;
+    const goldValue = rateForPurity(applicable.rate24k, f.purity) * (parseFloat(f.goldWt) || 0);
+    const makingValue = (parseFloat(f.goldWt) || 0) * (parseFloat(f.mcRate) || 0);
+    const diamondValue = (parseFloat(f.diaWt) || 0) * DIA_SALE;
+    return goldValue + makingValue + diamondValue;
+  };
+
+  const updateAndRecalc = (patch) => {
+    const next = { ...form, ...patch };
+    if (!priceOverridden) {
+      const auto = computeAutoPrice(next);
+      if (auto !== null) next.salePrice = Math.round(auto);
+    }
+    setForm(next);
+  };
+
+  const appliedRate = findApplicableRate(goldRates, form.date);
+  const appliedPurityRate = appliedRate ? rateForPurity(appliedRate.rate24k, form.purity) : null;
+
+  const resetToAuto = () => {
+    setPriceOverridden(false);
+    const auto = computeAutoPrice(form);
+    if (auto !== null) setForm(f => ({ ...f, salePrice: Math.round(auto) }));
+  };
 
   const gstPreview = (parseFloat(form.salePrice) || 0) * (GST_PCT / 100);
   const invoicePreview = (parseFloat(form.salePrice) || 0) + gstPreview;
@@ -681,6 +755,7 @@ function SalesTab({ enriched, onAdd, onRemove }) {
     await onAdd(form);
     setSaving(false);
     setForm(blank);
+    setPriceOverridden(false);
   };
 
   return (
@@ -688,9 +763,47 @@ function SalesTab({ enriched, onAdd, onRemove }) {
       <SectionTitle sub="One row per piece sold. Gold is priced pass-through, so margin comes purely from making/wastage and diamond spread. GST (3%) is calculated on top of sale price and tracked separately as tax.">Sales Entry</SectionTitle>
 
       <Card style={{ marginBottom: 22 }}>
+        <Eyebrow>Today's Gold Rate</Eyebrow>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14, alignItems: "end" }}>
+          <div><Label>Date</Label><Input type="date" value={rateDate} onChange={e => setRateDate(e.target.value)} /></div>
+          <div><Label>24K Rate (₹/g)</Label><Input type="number" placeholder={existingRateForDate ? String(existingRateForDate.rate24k) : "e.g. 7250"} value={rateInput} onChange={e => setRateInput(e.target.value)} /></div>
+          <div><Btn onClick={saveRate}>{savingRate ? <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} /> : <Plus size={14} />} {existingRateForDate ? "Update Rate" : "Save Rate"}</Btn></div>
+          <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 11.5, color: "#8A7C6B" }}>
+            {existingRateForDate ? `Saved rate for this date: ₹${existingRateForDate.rate24k}/g` : "No rate saved for this date yet"}
+          </div>
+        </div>
+
+        {rate24kPreview > 0 && (
+          <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10 }}>
+            {["24K", "22K", "18K", "14K", "9K"].map(p => (
+              <div key={p} style={{ background: COLORS.beigeLight, border: `1px solid ${COLORS.beigeDeep}`, borderRadius: 4, padding: "8px 10px", textAlign: "center" }}>
+                <div style={{ fontFamily: "'Jost',sans-serif", fontSize: 11, color: "#8A7C6B", fontWeight: 500 }}>{p}</div>
+                <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 13.5, color: COLORS.ink, fontWeight: 500 }}>
+                  {inr(rateForPurity(rate24kPreview, p))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {recentRates.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontFamily: "'Jost',sans-serif", fontSize: 11.5, color: "#8A7C6B", marginBottom: 6 }}>Recent rates</div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              {recentRates.map(r => (
+                <span key={r.date} style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 11.5, color: COLORS.ink, background: COLORS.beige, border: `1px solid ${COLORS.beigeDeep}`, borderRadius: 3, padding: "4px 8px" }}>
+                  {r.date}: ₹{r.rate24k}/g
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <Card style={{ marginBottom: 22 }}>
         <Eyebrow>Add a Sale</Eyebrow>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14 }}>
-          <div><Label>Date</Label><Input type="date" value={form.date} onChange={e => setForm({ ...form, date: e.target.value })} /></div>
+          <div><Label>Date</Label><Input type="date" value={form.date} onChange={e => updateAndRecalc({ date: e.target.value })} /></div>
           <div><Label>Store</Label>
             <Select value={form.store} onChange={e => setForm({ ...form, store: e.target.value })}>
               {STORES.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
@@ -702,7 +815,7 @@ function SalesTab({ enriched, onAdd, onRemove }) {
             </Select>
           </div>
           <div><Label>Gold Purity</Label>
-            <Select value={form.purity} onChange={e => setForm({ ...form, purity: e.target.value })}>
+            <Select value={form.purity} onChange={e => updateAndRecalc({ purity: e.target.value })}>
               {PURITY_OPTS.map(p => <option key={p}>{p}</option>)}
             </Select>
           </div>
@@ -716,17 +829,34 @@ function SalesTab({ enriched, onAdd, onRemove }) {
               {ORDER_TYPE_OPTS.map(o => <option key={o}>{o}</option>)}
             </Select>
           </div>
-          <div><Label>Gold Weight (g)</Label><Input type="number" step="0.01" placeholder="4.20" value={form.goldWt} onChange={e => setForm({ ...form, goldWt: e.target.value })} /></div>
-          <div><Label>Diamond Weight (ct)</Label><Input type="number" step="0.01" placeholder="0.85" value={form.diaWt} onChange={e => setForm({ ...form, diaWt: e.target.value })} /></div>
-          <div><Label>Making Rate Charged (₹/g)</Label><Input type="number" placeholder="1650–2000" value={form.mcRate} onChange={e => setForm({ ...form, mcRate: e.target.value })} /></div>
-          <div><Label>Sale Price before GST (₹)</Label><Input type="number" placeholder="e.g. 185000" value={form.salePrice} onChange={e => setForm({ ...form, salePrice: e.target.value })} /></div>
-        </div>
-        {form.salePrice && (
-          <div style={{ marginTop: 12, fontFamily: "'IBM Plex Mono',monospace", fontSize: 12, color: "#8A7C6B", display: "flex", gap: 20 }}>
-            <span>GST (3%): <b style={{ color: COLORS.ink }}>{inr(gstPreview)}</b></span>
-            <span>Invoice Total: <b style={{ color: COLORS.ink }}>{inr(invoicePreview)}</b></span>
+          <div><Label>Gold Weight (g)</Label><Input type="number" step="0.01" placeholder="4.20" value={form.goldWt} onChange={e => updateAndRecalc({ goldWt: e.target.value })} /></div>
+          <div><Label>Diamond Weight (ct)</Label><Input type="number" step="0.01" placeholder="0.85" value={form.diaWt} onChange={e => updateAndRecalc({ diaWt: e.target.value })} /></div>
+          <div><Label>Making Rate Charged (₹/g)</Label><Input type="number" placeholder="1650–2000" value={form.mcRate} onChange={e => updateAndRecalc({ mcRate: e.target.value })} /></div>
+          <div>
+            <Label>Sale Price before GST (₹) {priceOverridden && <span style={{ color: COLORS.burgundy, fontWeight: 400 }}>(manually overridden)</span>}</Label>
+            <Input type="number" placeholder="e.g. 185000" value={form.salePrice} onChange={e => { setPriceOverridden(true); setForm({ ...form, salePrice: e.target.value }); }} />
+            {priceOverridden && (
+              <button onClick={resetToAuto} style={{ background: "none", border: "none", padding: 0, marginTop: 4, cursor: "pointer", color: COLORS.burgundy, fontFamily: "'Jost',sans-serif", fontSize: 11.5, textDecoration: "underline" }}>
+                Reset to auto-calculated
+              </button>
+            )}
           </div>
-        )}
+        </div>
+
+        <div style={{ marginTop: 12, fontFamily: "'IBM Plex Mono',monospace", fontSize: 12, color: "#8A7C6B", display: "flex", gap: 20, flexWrap: "wrap" }}>
+          {appliedRate ? (
+            <span>Using {appliedRate.date} rate: <b style={{ color: COLORS.ink }}>{inr(appliedPurityRate)}/g</b> ({form.purity})</span>
+          ) : (
+            <span style={{ color: COLORS.burgundyBright }}>No gold rate entered yet — enter one above, or Sale Price will need to be typed in manually.</span>
+          )}
+          {form.salePrice !== "" && (
+            <>
+              <span>GST (3%): <b style={{ color: COLORS.ink }}>{inr(gstPreview)}</b></span>
+              <span>Invoice Total: <b style={{ color: COLORS.ink }}>{inr(invoicePreview)}</b></span>
+            </>
+          )}
+        </div>
+
         <div style={{ marginTop: 16 }}><Btn onClick={add}>{saving ? <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} /> : <Plus size={14} />} Add Sale</Btn></div>
       </Card>
 
